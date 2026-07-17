@@ -147,3 +147,7 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+
+# Local model artifacts
+/memvla-libero-spatial/
+/run_logs/

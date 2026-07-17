@@ -4,6 +4,7 @@ llama2.py
 Class definition for all LLMs derived from LlamaForCausalLM.
 """
 
+import os
 from typing import Optional, Sequence, Type
 
 import torch
@@ -61,13 +62,19 @@ class LLaMa2LLMBackbone(HFCausalLLMBackbone):
         inference_mode: bool = False,
         use_flash_attention_2: bool = True,
     ) -> None:
+        model_kwargs = dict(LLAMA2_MODELS[llm_backbone_id])
+        if inference_mode and llm_backbone_id == "llama2-7b-pure":
+            model_kwargs["hf_hub_path"] = os.environ.get(
+                "MEMVLA_LLAMA2_7B_PATH", model_kwargs["hf_hub_path"]
+            )
+
         super().__init__(
             llm_backbone_id,
             llm_max_length=llm_max_length,
             hf_token=hf_token,
             inference_mode=inference_mode,
             use_flash_attention_2=use_flash_attention_2,
-            **LLAMA2_MODELS[llm_backbone_id],
+            **model_kwargs,
         )
 
         # [Special Case] LLaMa-2 PAD Token Handling --> for clarity, we add an extra token (and resize)
