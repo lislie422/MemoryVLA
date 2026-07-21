@@ -181,6 +181,7 @@ class CogMemBank(nn.Module):
         self.fusion_type = fusion_type
         self.consolidate_type = consolidate_type
         self.update_fused = update_fused
+        self.retrieval_enabled = True
 
         self.retrieval_blocks = nn.ModuleList([
             CrossTransformerBlock(self.token_size)
@@ -203,6 +204,48 @@ class CogMemBank(nn.Module):
         # bank[episode_id] = [(timestep, feat[N,D]), ...]
         self.bank = {}
         self.eid_stream = None
+
+    @torch.no_grad()
+    def snapshot_runtime_state(self) -> dict:
+        bank = {}
+        for episode_id, entries in self.bank.items():
+            bank[episode_id] = [
+                (
+                    timestep.detach().clone() if torch.is_tensor(timestep) else deepcopy(timestep),
+                    feature.detach().clone(),
+                )
+                for timestep, feature in entries
+            ]
+
+        return {
+            "bank": bank,
+            "eid_stream": deepcopy(self.eid_stream),
+            "retrieval_enabled": self.retrieval_enabled,
+        }
+
+    @torch.no_grad()
+    def restore_runtime_state(self, state: dict) -> None:
+        if not isinstance(state, dict) or "bank" not in state:
+            raise ValueError("Memory state must be a snapshot created by snapshot_runtime_state().")
+
+        bank = {}
+        for episode_id, entries in state["bank"].items():
+            bank[episode_id] = [
+                (
+                    timestep.detach().clone() if torch.is_tensor(timestep) else deepcopy(timestep),
+                    feature.detach().clone(),
+                )
+                for timestep, feature in entries
+            ]
+
+        self.bank = bank
+        self.eid_stream = deepcopy(state.get("eid_stream"))
+        self.retrieval_enabled = bool(state.get("retrieval_enabled", True))
+
+    def set_retrieval_enabled(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a bool")
+        self.retrieval_enabled = enabled
 
     def clear_episode(self, episode_id):
         self.bank.pop(episode_id, None)
@@ -291,7 +334,7 @@ class CogMemBank(nn.Module):
             working_mem = tokens[i].unsqueeze(0)  # (1, N, D)
 
             hist = self.bank.get(eid, [])
-            if len(hist) > 0:
+            if self.retrieval_enabled and len(hist) > 0:
                 hist_feats = [feat for _, feat in hist]
                 episode_mem = torch.stack(hist_feats, dim=0).reshape(-1, D).unsqueeze(0)  # (1, T*N, D)
 
@@ -473,6 +516,36 @@ class MemoryVLA(nn.Module):
     @property
     def vision_backbone(self) -> VisionBackbone:
         return self.vlm.vision_backbone
+
+    @torch.no_grad()
+    def snapshot_runtime_state(self) -> dict:
+        return {
+            "cog_memory": self.cog_mem_bank.snapshot_runtime_state(),
+            "per_memory": self.per_mem_bank.snapshot_runtime_state(),
+            "cur_timestep": self.cur_timestep,
+        }
+
+    @torch.no_grad()
+    def restore_runtime_state(self, state: dict) -> None:
+        required_keys = {"cog_memory", "per_memory", "cur_timestep"}
+        if not isinstance(state, dict) or not required_keys.issubset(state):
+            raise ValueError("Runtime state is incomplete or invalid.")
+
+        self.cog_mem_bank.restore_runtime_state(state["cog_memory"])
+        self.per_mem_bank.restore_runtime_state(state["per_memory"])
+        self.cur_timestep = int(state["cur_timestep"])
+
+    def set_memory_retrieval_enabled(self, enabled: bool) -> None:
+        self.cog_mem_bank.set_retrieval_enabled(enabled)
+        self.per_mem_bank.set_retrieval_enabled(enabled)
+
+    def get_runtime_state_summary(self) -> dict:
+        return {
+            "cur_timestep": self.cur_timestep,
+            "cog_entries": sum(len(entries) for entries in self.cog_mem_bank.bank.values()),
+            "per_entries": sum(len(entries) for entries in self.per_mem_bank.bank.values()),
+            "retrieval_enabled": self.cog_mem_bank.retrieval_enabled and self.per_mem_bank.retrieval_enabled,
+        }
     
     def freeze_backbones(self, stage):
         self.vlm.freeze_backbones(stage)

@@ -3,6 +3,7 @@ from PIL import Image
 from typing import Optional
 import os
 import argparse
+import random
 import yaml
 from argparse import Namespace
 import math
@@ -76,17 +77,87 @@ class MemVLAService:
             self.action_ensembler = None
 
         self.args = args
+        self.experiment_states = {}
         self.reset()
 
     def reset(self) -> None:
         if self.action_ensemble:
             self.action_ensembler.reset()
 
+    @staticmethod
+    def _capture_rng_state() -> dict:
+        numpy_state = np.random.get_state()
+        return {
+            "python": random.getstate(),
+            "numpy": (numpy_state[0], numpy_state[1].copy(), *numpy_state[2:]),
+            "torch_cpu": torch.get_rng_state().clone(),
+            "torch_cuda": [state.clone() for state in torch.cuda.get_rng_state_all()],
+        }
+
+    @staticmethod
+    def _restore_rng_state(state: dict) -> None:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"])
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+    @staticmethod
+    def _validate_snapshot_name(name: str) -> str:
+        if not isinstance(name, str) or not name.strip() or len(name) > 128:
+            raise ValueError("Snapshot name must contain 1 to 128 characters.")
+        return name.strip()
+
+    def save_experiment_state(self, name: str) -> dict:
+        if self.action_ensemble:
+            raise RuntimeError("The experiment API requires action chunking or single-action inference.")
+        name = self._validate_snapshot_name(name)
+        if name not in self.experiment_states and len(self.experiment_states) >= 32:
+            raise RuntimeError("At most 32 experiment snapshots may be retained at once.")
+        self.experiment_states[name] = {
+            "model": self.vla.snapshot_runtime_state(),
+            "rng": self._capture_rng_state(),
+        }
+        return self.vla.get_runtime_state_summary()
+
+    def restore_experiment_state(self, name: str) -> dict:
+        name = self._validate_snapshot_name(name)
+        if name not in self.experiment_states:
+            raise KeyError(f"Unknown experiment snapshot: {name}")
+        state = self.experiment_states[name]
+        self.vla.restore_runtime_state(state["model"])
+        self._restore_rng_state(state["rng"])
+        return self.vla.get_runtime_state_summary()
+
+    def delete_experiment_state(self, name: str) -> dict:
+        name = self._validate_snapshot_name(name)
+        if name not in self.experiment_states:
+            raise KeyError(f"Unknown experiment snapshot: {name}")
+        del self.experiment_states[name]
+        return self.vla.get_runtime_state_summary()
+
+    def set_memory_retrieval_enabled(self, enabled: bool) -> dict:
+        self.vla.set_memory_retrieval_enabled(enabled)
+        return self.vla.get_runtime_state_summary()
+
+    def set_experiment_seed(self, seed: int) -> dict:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        return self.vla.get_runtime_state_summary()
+
+    def get_experiment_status(self) -> dict:
+        return {
+            "snapshots": sorted(self.experiment_states),
+            "memory": self.vla.get_runtime_state_summary(),
+        }
+
     def step(
         self,
         image: str,
         task_description: str = None,
         episode_first_frame: str = 'False',
+        return_normalized: bool = False,
         *args, **kwargs,
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """
@@ -129,6 +200,7 @@ class MemVLAService:
             # Please adjust this line according to the control mode of different grippers.
             unnormed_actions[6] = unnormed_actions[6] > 0.5
             action = unnormed_actions.tolist()
+            normalized_action = normalized_actions[0].tolist()
         elif self.action_chunking:
             # [IMPORTANT!]: Please modify the code here to output multiple actions at once.
             # The code below only outputs the first action in the chunking.
@@ -138,15 +210,19 @@ class MemVLAService:
                 for i in range(0, self.action_chunking_window):
                     chunked_actions.append(unnormed_actions[i].tolist())
                 action = chunked_actions
+                normalized_action = normalized_actions[:self.action_chunking_window].tolist()
             else:
                 raise ValueError("Please specify the 'action_chunking_window' when using action chunking.")
         else:
             # Output the first action in the chunking. Can be modified to output multiple actions at once.
             unnormed_actions = unnormed_actions[0]
             action = unnormed_actions.tolist()
+            normalized_action = normalized_actions[0].tolist()
 
         print(f"Instruction: {task_description}")
         # print(f"Model path: {self.args.saved_model_path} at port {self.args.port}")
+        if return_normalized:
+            return action, normalized_action
         return action
 
 
@@ -192,6 +268,7 @@ parser.add_argument("--action_ensemble_horizon", type=int, default=2)
 parser.add_argument("--adaptive_ensemble_alpha", type=float, default=0.1)
 parser.add_argument("--action_chunking", action="store_true")
 parser.add_argument("--action_chunking_window", type=int, default=None)
+parser.add_argument("--enable_experiment_api", action="store_true")
 
 args = parser.parse_args()
 
@@ -227,6 +304,20 @@ inferencer = MemVLAService(
 )
 
 
+def _experiment_api_disabled_response():
+    if args.enable_experiment_api:
+        return None
+    return jsonify({"error": "Experiment API is disabled. Start deploy.py with --enable_experiment_api."}), 403
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "ready",
+        "experiment_api_enabled": bool(args.enable_experiment_api),
+    })
+
+
 @app.route('/process_frame', methods=['POST'])
 def inference():
     # Check if image is provided
@@ -244,10 +335,7 @@ def inference():
         return jsonify({'error': 'No episode_first_frame provided'}), 400
     episode_first_frame = request.form['episode_first_frame']
 
-    # Save image to temporary file and resize to expected dimensions
-    with tempfile.NamedTemporaryFile(delete=False) as temp_image:
-        image.save(temp_image.name)
-        temp_image_path = temp_image.name
+    return_normalized = request.form.get('return_normalized', 'False') == 'True'
 
     # Construct input query and prepare for inference
     input_query = {
@@ -255,8 +343,20 @@ def inference():
         'episode_first_frame': episode_first_frame,
     }
 
-    # Run inference
-    answer = inferencer.step(temp_image_path, **input_query)
+    # Save image to a temporary file because the existing preprocessing path expects a path.
+    with tempfile.NamedTemporaryFile(delete=False) as temp_image:
+        image.save(temp_image.name)
+        temp_image_path = temp_image.name
+
+    try:
+        result = inferencer.step(temp_image_path, return_normalized=return_normalized, **input_query)
+    finally:
+        os.unlink(temp_image_path)
+
+    if return_normalized:
+        answer, normalized_action = result
+    else:
+        answer = result
     print(answer)
 
     # Convert action array to string based on different modes
@@ -270,7 +370,52 @@ def inference():
         # For single action mode
         action_str = ' '.join([str(x) for x in answer])
 
-    return jsonify({'response': action_str})
+    response = {'response': action_str}
+    if return_normalized:
+        response.update({
+            'action': answer,
+            'normalized_action': normalized_action,
+            'memory': inferencer.vla.get_runtime_state_summary(),
+        })
+    return jsonify(response)
+
+
+@app.route('/experiment/control', methods=['POST'])
+def experiment_control():
+    disabled_response = _experiment_api_disabled_response()
+    if disabled_response is not None:
+        return disabled_response
+
+    payload = request.get_json(silent=True) or {}
+    action = payload.get('action')
+
+    try:
+        if action == 'save':
+            memory = inferencer.save_experiment_state(payload.get('name'))
+        elif action == 'restore':
+            memory = inferencer.restore_experiment_state(payload.get('name'))
+        elif action == 'delete':
+            memory = inferencer.delete_experiment_state(payload.get('name'))
+        elif action == 'set_retrieval':
+            enabled = payload.get('enabled')
+            if not isinstance(enabled, bool):
+                raise ValueError("set_retrieval requires a boolean 'enabled' field.")
+            memory = inferencer.set_memory_retrieval_enabled(enabled)
+        elif action == 'seed':
+            seed = payload.get('seed')
+            if not isinstance(seed, int):
+                raise ValueError("seed requires an integer 'seed' field.")
+            memory = inferencer.set_experiment_seed(seed)
+        elif action == 'status':
+            return jsonify({'response': inferencer.get_experiment_status()})
+        else:
+            raise ValueError("Unknown action. Use save, restore, delete, set_retrieval, seed, or status.")
+    except (KeyError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+
+    return jsonify({'response': memory})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", debug=False, port=args.port)
