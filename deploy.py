@@ -47,6 +47,8 @@ class MemVLAService:
             "model_id_or_path", "saved_model_path", "pretrained_checkpoint",
         ]:
             kwargs.pop(k, None)
+        if not kwargs.get("hf_token"):
+            kwargs["hf_token"] = os.environ.get("HF_TOKEN")
 
         self.vla = load_vla(
           model_id_or_path=saved_model_path,
